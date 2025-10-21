@@ -1,31 +1,31 @@
-// server.js (GitHub-backed, fixed)
+// server.js (GitHub-backed, Render-ready, ESM, fixed)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import axios from "axios";
-import cheerio from "cheerio";
+import { load as cheerioLoad } from "cheerio"; // ✅ correct ESM import
 import { nanoid } from "nanoid";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ==== CORS (set your static site origin) ====
+// ==== CORS (set your static site origin, e.g. https://yoursite.example) ====
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
 // ==== GitHub repo config (REQUIRED) ====
-// Example: GITHUB_REPO="yourname/your-private-repo"
+// Example: GITHUB_REPO="yourname/your-repo"
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || "";
 const GITHUB_REPO   = process.env.GITHUB_REPO || "";        // "owner/name"
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 
-// paths in the repo
+// repo file paths
 const URLS_PATH  = "data/urls.json";
 const PINS_PATH  = "data/pins.json";
 const STATE_PATH = "data/state.json";
 
-// basic guard
+// guard
 if (!GITHUB_TOKEN || !GITHUB_REPO) {
-  console.warn("[WARN] Missing GITHUB_TOKEN or GITHUB_REPO. API will error on data access.");
+  console.warn("[WARN] Missing GITHUB_TOKEN or GITHUB_REPO. Data access will fail.");
 }
 
 app.use(helmet());
@@ -51,27 +51,29 @@ const gh = axios.create({
     "User-Agent": "weekly-link-giver/1.0",
     Accept: "application/vnd.github+json"
   },
-  timeout: 10000
+  timeout: 15000
 });
 
-// Fetch file content + sha from GitHub; auto-create if missing.
+// encode each segment, keep slashes (GitHub expects real path separators)
+const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+
+// Fetch content + sha. If missing, auto-init with provided value.
 async function ghGetOrInit(jsonPath, initValue) {
   try {
-    const { data } = await gh.get(`/contents/${encodeURIComponent(jsonPath)}`, {
-      params: { ref: GITHUB_BRANCH }
-    });
+    const { data } = await gh.get(`/contents/${encPath(jsonPath)}`, { params: { ref: GITHUB_BRANCH } });
     const content = Buffer.from(data.content || "", "base64").toString("utf8");
-    return { json: JSON.parse(content || "{}"), sha: data.sha };
+    return { json: content ? JSON.parse(content) : initValue, sha: data.sha };
   } catch (e) {
     if (e.response?.status === 404) {
       const res = await ghPut(jsonPath, initValue, null, `init ${jsonPath}`);
       return { json: initValue, sha: res.sha };
     }
+    console.error("[ghGetOrInit] error", e.response?.status, e.message);
     throw e;
   }
 }
 
-// Put JSON to GitHub with optimistic concurrency (sha optional)
+// Write JSON (create or update). sha optional for create.
 async function ghPut(jsonPath, jsonValue, sha, message) {
   const payload = {
     message: message || `update ${jsonPath}`,
@@ -79,25 +81,25 @@ async function ghPut(jsonPath, jsonValue, sha, message) {
     branch: GITHUB_BRANCH
   };
   if (sha) payload.sha = sha;
-
-  const { data } = await gh.put(`/contents/${encodeURIComponent(jsonPath)}`, payload);
+  const { data } = await gh.put(`/contents/${encPath(jsonPath)}`, payload);
   return { sha: data.content.sha };
 }
 
-// Update with a single retry on conflict
+// Update with 1 retry on conflict
 async function ghUpdate(jsonPath, mutator, initValue, commitMsg) {
-  const { json, sha } = await ghGetOrInit(jsonPath, initValue);
-  const updated = mutator(json);
+  const first = await ghGetOrInit(jsonPath, initValue);
+  const updated = mutator(structuredClone(first.json));
   try {
-    await ghPut(jsonPath, updated, sha, commitMsg);
+    await ghPut(jsonPath, updated, first.sha, commitMsg);
     return updated;
   } catch (e) {
     if (e.response?.status === 409) {
       const fresh = await ghGetOrInit(jsonPath, initValue);
-      const updated2 = mutator(fresh.json);
+      const updated2 = mutator(structuredClone(fresh.json));
       await ghPut(jsonPath, updated2, fresh.sha, commitMsg + " (retry)");
       return updated2;
     }
+    console.error("[ghUpdate] error", e.response?.status, e.message);
     throw e;
   }
 }
@@ -112,8 +114,13 @@ async function getPageMeta(targetUrl) {
   let title = "";
   let favicon = "";
   try {
-    const resp = await axios.get(targetUrl, { timeout: 8000 });
-    const $ = cheerio.load(resp.data);
+    const resp = await axios.get(targetUrl, {
+      timeout: 8000,
+      // Some sites require a UA
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; WeeklyLinkBot/1.0)" }
+    });
+    const $ = cheerioLoad(resp.data);
+
     title = $("title").first().text().trim() || "";
 
     let iconHref =
@@ -128,11 +135,12 @@ async function getPageMeta(targetUrl) {
       const base = new URL(targetUrl);
       favicon = `${base.origin}/favicon.ico`;
     }
-  } catch {
+  } catch (e) {
     try {
       const base = new URL(targetUrl);
       favicon = `${base.origin}/favicon.ico`;
     } catch {}
+    console.warn("[getPageMeta] probe fallback", e.message);
   }
   return { title, favicon };
 }
@@ -158,6 +166,7 @@ app.get("/api/urls", async (req, res) => {
       urls: onlyActive.map(({ id, title, favicon, url }) => ({ id, title, favicon, url }))
     });
   } catch (e) {
+    console.error("/api/urls error", e.message);
     res.status(500).json({ ok: false, error: "read failed" });
   }
 });
@@ -172,6 +181,7 @@ app.get("/api/resolve/:id", async (req, res) => {
     if (!item) return res.status(404).json({ ok: false, error: "Not found" });
     res.json({ ok: true, id: item.id, title: item.title, favicon: item.favicon, url: item.url });
   } catch (e) {
+    console.error("/api/resolve error", e.message);
     res.status(500).json({ ok: false, error: "resolve failed" });
   }
 });
@@ -182,7 +192,8 @@ app.post("/api/probe", async (req, res) => {
   try {
     const meta = await getPageMeta(url);
     res.json({ ok: true, meta });
-  } catch {
+  } catch (e) {
+    console.error("/api/probe error", e.message);
     res.status(500).json({ ok: false, error: "probe failed" });
   }
 });
@@ -203,7 +214,6 @@ function auth(req, res, next) {
   next();
 }
 
-// ✅ FIXED: `res` was truncated before. This is the corrected route.
 app.post("/api/admin/add", auth, async (req, res) => {
   const { url, title, favicon } = req.body || {};
   if (!url) return res.status(400).json({ ok: false, error: "url required" });
@@ -227,6 +237,7 @@ app.post("/api/admin/add", auth, async (req, res) => {
       "admin add url"
     );
 
+    // Fill missing title/icon in a follow-up commit (non-blocking)
     const last = result.urls[result.urls.length - 1];
     if (!title || !favicon) {
       try {
@@ -244,11 +255,14 @@ app.post("/api/admin/add", auth, async (req, res) => {
           { urls: [] },
           "fill title/favicon"
         );
-      } catch {}
+      } catch (e) {
+        console.warn("[admin/add] meta fill failed", e.message);
+      }
     }
 
     res.json({ ok: true, id: last.id });
-  } catch {
+  } catch (e) {
+    console.error("/api/admin/add error", e.message);
     res.status(500).json({ ok: false, error: "add failed" });
   }
 });
@@ -268,7 +282,8 @@ app.delete("/api/admin/remove/:id", auth, async (req, res) => {
       "admin remove url"
     );
     res.json({ ok: true, removed });
-  } catch {
+  } catch (e) {
+    console.error("/api/admin/remove error", e.message);
     res.status(500).json({ ok: false, error: "remove failed" });
   }
 });
@@ -284,7 +299,8 @@ app.post("/api/admin/toggle", auth, async (req, res) => {
       "toggle service state"
     );
     res.json({ ok: true, enabled: updated.enabled });
-  } catch {
+  } catch (e) {
+    console.error("/api/admin/toggle error", e.message);
     res.status(500).json({ ok: false, error: "toggle failed" });
   }
 });
