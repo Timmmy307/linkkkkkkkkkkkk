@@ -1,4 +1,4 @@
-// server.js (GitHub-backed)
+// server.js (GitHub-backed, fixed)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -14,7 +14,6 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
 // ==== GitHub repo config (REQUIRED) ====
 // Example: GITHUB_REPO="yourname/your-private-repo"
-// Make sure the repo exists and your token has "repo" scope.
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || "";
 const GITHUB_REPO   = process.env.GITHUB_REPO || "";        // "owner/name"
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
@@ -65,7 +64,6 @@ async function ghGetOrInit(jsonPath, initValue) {
     return { json: JSON.parse(content || "{}"), sha: data.sha };
   } catch (e) {
     if (e.response?.status === 404) {
-      // init file
       const res = await ghPut(jsonPath, initValue, null, `init ${jsonPath}`);
       return { json: initValue, sha: res.sha };
     }
@@ -83,7 +81,6 @@ async function ghPut(jsonPath, jsonValue, sha, message) {
   if (sha) payload.sha = sha;
 
   const { data } = await gh.put(`/contents/${encodeURIComponent(jsonPath)}`, payload);
-  // data.content.sha is the new sha
   return { sha: data.content.sha };
 }
 
@@ -92,11 +89,10 @@ async function ghUpdate(jsonPath, mutator, initValue, commitMsg) {
   const { json, sha } = await ghGetOrInit(jsonPath, initValue);
   const updated = mutator(json);
   try {
-    const res = await ghPut(jsonPath, updated, sha, commitMsg);
+    await ghPut(jsonPath, updated, sha, commitMsg);
     return updated;
   } catch (e) {
     if (e.response?.status === 409) {
-      // fetch latest and retry once
       const fresh = await ghGetOrInit(jsonPath, initValue);
       const updated2 = mutator(fresh.json);
       await ghPut(jsonPath, updated2, fresh.sha, commitMsg + " (retry)");
@@ -207,4 +203,92 @@ function auth(req, res, next) {
   next();
 }
 
-app.post("/api/admin/add", auth, async (req, r
+// ✅ FIXED: `res` was truncated before. This is the corrected route.
+app.post("/api/admin/add", auth, async (req, res) => {
+  const { url, title, favicon } = req.body || {};
+  if (!url) return res.status(400).json({ ok: false, error: "url required" });
+  try {
+    const result = await ghUpdate(
+      URLS_PATH,
+      (db) => {
+        db.urls = db.urls || [];
+        const id = nanoid(10);
+        db.urls.push({
+          id,
+          url,
+          title: title || "",
+          favicon: favicon || "",
+          active: true,
+          createdAt: Date.now()
+        });
+        return db;
+      },
+      { urls: [] },
+      "admin add url"
+    );
+
+    const last = result.urls[result.urls.length - 1];
+    if (!title || !favicon) {
+      try {
+        const meta = await getPageMeta(url);
+        await ghUpdate(
+          URLS_PATH,
+          (db) => {
+            const idx = db.urls.findIndex((u) => u.id === last.id);
+            if (idx >= 0) {
+              db.urls[idx].title = db.urls[idx].title || meta.title || new URL(url).hostname;
+              db.urls[idx].favicon = db.urls[idx].favicon || meta.favicon || "";
+            }
+            return db;
+          },
+          { urls: [] },
+          "fill title/favicon"
+        );
+      } catch {}
+    }
+
+    res.json({ ok: true, id: last.id });
+  } catch {
+    res.status(500).json({ ok: false, error: "add failed" });
+  }
+});
+
+app.delete("/api/admin/remove/:id", auth, async (req, res) => {
+  try {
+    let removed = 0;
+    await ghUpdate(
+      URLS_PATH,
+      (db) => {
+        const before = (db.urls || []).length;
+        db.urls = (db.urls || []).filter((u) => u.id !== req.params.id);
+        removed = before - db.urls.length;
+        return db;
+      },
+      { urls: [] },
+      "admin remove url"
+    );
+    res.json({ ok: true, removed });
+  } catch {
+    res.status(500).json({ ok: false, error: "remove failed" });
+  }
+});
+
+app.post("/api/admin/toggle", auth, async (req, res) => {
+  const { enabled } = req.body || {};
+  if (typeof enabled !== "boolean") return res.status(400).json({ ok: false, error: "enabled boolean required" });
+  try {
+    const updated = await ghUpdate(
+      STATE_PATH,
+      (_db) => ({ enabled }),
+      { enabled: true },
+      "toggle service state"
+    );
+    res.json({ ok: true, enabled: updated.enabled });
+  } catch {
+    res.status(500).json({ ok: false, error: "toggle failed" });
+  }
+});
+
+app.get("/", (_req, res) => res.json({ ok: true, service: "weekly-link-giver (github-backed)" }));
+
+app.listen(PORT, () => console.log(`API on ${PORT}`));
