@@ -10,7 +10,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ==== CORS (set your static site origin, e.g. https://yoursite.example) ====
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://nice.code-faction.gleeze.com/";
 
 // ==== GitHub repo config (REQUIRED) ====
 // Example: GITHUB_REPO="yourname/your-repo"
